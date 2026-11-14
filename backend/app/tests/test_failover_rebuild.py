@@ -1,4 +1,9 @@
-from app.modules.failover_offset_rebuild import Evidence, compute_candidate
+from app.modules.failover_offset_rebuild import (
+    Evidence,
+    compute_candidate,
+    evidence_fingerprint,
+    side_scores,
+)
 
 
 def _ev(**kw):
@@ -109,3 +114,46 @@ def test_ledger_only_without_sink_adoptable():
     r = compute_candidate(ev)
     assert r.adoptable is True
     assert r.candidate == 2
+
+
+def test_side_scores_agree_for_clean_evidence():
+    ev = _ev(applied_seqs=[1, 2, 3], sink_last_seqs=[2, 3], ledger_applied_seqs=[1, 2, 3])
+    scores = side_scores(ev)
+    assert scores["ledger_side"]["candidate_score"] == 3
+    assert scores["sink_side"]["candidate_score"] == 3
+    assert scores["conflict"] is False
+    assert scores["agree"] is True
+    assert scores["sufficient"] is True
+    assert scores["evidence_fingerprint"]
+
+
+def test_side_scores_conflict_when_sink_ahead():
+    ev = _ev(applied_seqs=[1, 2, 3], sink_last_seqs=[3, 9], ledger_applied_seqs=[1, 2, 3])
+    scores = side_scores(ev)
+    assert scores["ledger_side"]["candidate_score"] == 3
+    assert scores["sink_side"]["candidate_score"] == 9
+    assert scores["conflict"] is True
+    assert 9 in scores["sink_side"]["unexplained_seqs"]
+    assert scores["sink_side"]["ahead_of_ledger_by"] == 6
+
+
+def test_side_scores_conflict_on_ledger_disagreement():
+    ev = _ev(applied_seqs=[1, 2, 3], sink_last_seqs=[3], ledger_applied_seqs=[1, 2])
+    scores = side_scores(ev)
+    assert scores["ledger_side"]["sources_agree"] is False
+    assert scores["ledger_side"]["only_in_applied"] == [3]
+    assert scores["conflict"] is True
+
+
+def test_side_scores_insufficient_without_evidence():
+    scores = side_scores(_ev())
+    assert scores["sufficient"] is False
+    assert scores["conflict"] is False
+
+
+def test_fingerprint_is_order_and_duplicate_insensitive():
+    a = _ev(applied_seqs=[3, 1, 2], sink_last_seqs=[3], ledger_applied_seqs=[1, 2, 3])
+    b = _ev(applied_seqs=[1, 2, 2, 3], sink_last_seqs=[3], ledger_applied_seqs=[3, 2, 1])
+    assert evidence_fingerprint(a) == evidence_fingerprint(b)
+    c = _ev(applied_seqs=[1, 2], sink_last_seqs=[3], ledger_applied_seqs=[1, 2])
+    assert evidence_fingerprint(a) != evidence_fingerprint(c)

@@ -39,6 +39,8 @@ seq 1..candidate 都已有应用事实、candidate+1 尚未应用，因此绝不
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -78,6 +80,107 @@ def _longest_contiguous_prefix(seqs: Iterable[int]) -> int:
     return cursor
 
 
+def evidence_fingerprint(evidence: Evidence) -> str:
+    """证据快照指纹：确认时据此判断任务挂起期间证据是否变化。"""
+    payload = {
+        "stream_id": evidence.stream_id,
+        "applied_seqs": sorted(set(evidence.applied_seqs)),
+        "sink_last_seqs": sorted(set(evidence.sink_last_seqs)),
+        "quarantine_seqs": sorted(set(evidence.quarantine_seqs)),
+        "ledger_applied_seqs": sorted(set(evidence.ledger_applied_seqs)),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def evidence_from_detail(detail: dict[str, Any]) -> Evidence:
+    """从任务里持久化的证据摘要还原证据快照（对照接口与任务同源）。
+
+    旧版本任务未持久化 ``ledger_applied_seqs``；缺失时按 ``applied_seqs`` 兜底，
+    避免把历史快照误判成“账本两来源冲突”。当前证据仍以实时扫库为准。
+    """
+    applied = [int(x) for x in detail.get("applied_seqs") or []]
+    ledger = detail.get("ledger_applied_seqs")
+    return Evidence(
+        stream_id=int(detail.get("stream_id") or 0),
+        applied_seqs=applied,
+        sink_last_seqs=[int(x) for x in detail.get("sink_last_seqs") or []],
+        quarantine_seqs=[int(x) for x in detail.get("quarantine_seqs") or []],
+        ledger_applied_seqs=(
+            [int(x) for x in ledger] if ledger is not None else list(applied)
+        ),
+    )
+
+
+def side_scores(evidence: Evidence) -> dict[str, Any]:
+    """账本侧 / Sink 侧各自的候选位点打分与冲突判定（只读、纯函数）。
+
+    任务视图、证据对照接口、页面三处都调用本函数，保证同源。
+    """
+    applied = set(evidence.applied_seqs)
+    ledger_applied = set(evidence.ledger_applied_seqs)
+    sink_seq_set = set(evidence.sink_last_seqs)
+
+    ledger_prefix = _longest_contiguous_prefix(applied)
+    ledger_source_prefix = _longest_contiguous_prefix(ledger_applied)
+    sink_max = max(evidence.sink_last_seqs, default=0)
+
+    only_in_applied = sorted(applied - ledger_applied)
+    only_in_ledger = sorted(ledger_applied - applied)
+    unexplained_sink = sorted(sink_seq_set - applied)
+    sink_ahead = max(0, sink_max - ledger_prefix)
+    quarantine_overlap = sorted(set(evidence.quarantine_seqs) & applied)
+
+    ledger_side = {
+        "candidate_score": ledger_prefix,
+        "ledger_source_candidate_score": ledger_source_prefix,
+        "applied_count": len(applied),
+        "applied_max_seq": max(applied, default=0),
+        "ledger_applied_count": len(ledger_applied),
+        "sources_agree": applied == ledger_applied,
+        "only_in_applied": only_in_applied,
+        "only_in_ledger": only_in_ledger,
+        "quarantine_overlap": quarantine_overlap,
+    }
+    sink_side = {
+        "candidate_score": sink_max,
+        "record_count": len(sink_seq_set),
+        "sink_last_seqs": sorted(sink_seq_set),
+        "unexplained_seqs": unexplained_sink,
+        "ahead_of_ledger_by": sink_ahead,
+    }
+
+    conflict_reasons: list[str] = []
+    if only_in_applied or only_in_ledger:
+        conflict_reasons.append(
+            "账本两来源不一致：applied_seqs 独有 "
+            f"{only_in_applied}，change_ledger(applied) 独有 {only_in_ledger}"
+        )
+    if unexplained_sink:
+        conflict_reasons.append(
+            "Sink 出现账本中不存在的 last_seq：" + ",".join(map(str, unexplained_sink))
+        )
+    if sink_ahead > 0:
+        conflict_reasons.append(
+            f"Sink 候选分 {sink_max} 越过账本连续前缀 {ledger_prefix}（缺口 {sink_ahead}）"
+        )
+    if quarantine_overlap:
+        conflict_reasons.append(
+            "同一 seq 既在隔离区又被标记已应用：" + ",".join(map(str, quarantine_overlap))
+        )
+
+    return {
+        "stream_id": evidence.stream_id,
+        "evidence_fingerprint": evidence_fingerprint(evidence),
+        "sufficient": bool(applied or sink_seq_set),
+        "ledger_side": ledger_side,
+        "sink_side": sink_side,
+        "conflict": bool(conflict_reasons),
+        "conflict_reasons": conflict_reasons,
+        "agree": not conflict_reasons,
+    }
+
+
 def compute_candidate(evidence: Evidence) -> CandidateResult:
     """纯函数：根据证据快照计算候选位点并执行全部切换门禁。"""
     applied = set(evidence.applied_seqs)
@@ -88,6 +191,8 @@ def compute_candidate(evidence: Evidence) -> CandidateResult:
     candidate = _longest_contiguous_prefix(applied)
     max_sink = max(evidence.sink_last_seqs, default=0)
     detail: dict[str, Any] = {
+        "stream_id": evidence.stream_id,
+        "evidence_fingerprint": evidence_fingerprint(evidence),
         "applied_max": max(applied, default=0),
         "applied_count": len(applied),
         "sink_max_last_seq": max_sink,
@@ -97,6 +202,7 @@ def compute_candidate(evidence: Evidence) -> CandidateResult:
         "applied_seqs": sorted(applied),
         "sink_last_seqs": sorted(sink_seq_set),
         "quarantine_seqs": sorted(quarantined),
+        "ledger_applied_seqs": sorted(ledger_applied),
     }
     basis = [
         f"applied_seqs 共 {len(applied)} 条，max={max(applied, default=0)}",

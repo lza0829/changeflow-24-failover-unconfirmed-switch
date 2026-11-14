@@ -24,6 +24,15 @@ def get_task(task_id: int):
         raise HTTPException(404, str(exc)) from exc
 
 
+@router.get("/failover-rebuild/tasks/{task_id}/comparison")
+def get_comparison(task_id: int):
+    """证据对照（只读）：按 task_id 返回 ledger 侧 / sink 侧候选分与是否冲突。"""
+    try:
+        return service.get_comparison(task_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @router.post("/failover-rebuild/tasks")
 def start_rebuild(body: RebuildStartRequest):
     try:

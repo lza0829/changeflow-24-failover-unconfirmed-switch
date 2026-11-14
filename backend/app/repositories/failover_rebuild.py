@@ -135,6 +135,10 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     for key in ("scan_counts_json", "evidence_json", "basis_json", "reasons_json", "audit_json"):
         item[key.removesuffix("_json")] = json.loads(item.pop(key) or "[]")
     item["adoptable"] = bool(item["adoptable"])
+    evidence = item.get("evidence")
+    item["evidence_fingerprint"] = (
+        evidence.get("evidence_fingerprint") if isinstance(evidence, dict) else None
+    )
     return item
 
 
@@ -146,14 +150,17 @@ def get_task(conn: sqlite3.Connection, task_id: int) -> dict[str, Any] | None:
     return _row_to_dict(row) if row else None
 
 
-def list_tasks(conn: sqlite3.Connection, stream_id: int | None = None) -> list[dict[str, Any]]:
+def list_tasks(
+    conn: sqlite3.Connection, stream_id: int | None = None, limit: int = 100
+) -> list[dict[str, Any]]:
     if stream_id is None:
         rows = conn.execute(
-            "SELECT * FROM failover_rebuild_tasks ORDER BY id DESC LIMIT 100"
+            "SELECT * FROM failover_rebuild_tasks ORDER BY id DESC LIMIT ?",
+            (limit,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM failover_rebuild_tasks WHERE stream_id=? ORDER BY id DESC LIMIT 100",
-            (stream_id,),
+            "SELECT * FROM failover_rebuild_tasks WHERE stream_id=? ORDER BY id DESC LIMIT ?",
+            (stream_id, limit),
         ).fetchall()
     return [_row_to_dict(r) for r in rows]

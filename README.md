@@ -59,9 +59,22 @@ Python 3.12 + FastAPI + SQLite；Vue 3 + Vite + Nginx。
 2. **门禁**：G1 证据非空；G2 Sink 不得超出账本；G3 Sink 不得越过连续前缀；
    G4 隔离区与已应用集合互斥；G5 账本两来源一致。任一不过即拒绝切换，任务落
    `rejected`，不允许标记成功。
-3. **确认才切换**：确认前重新扫库复核，通过后在同一事务写新位点并留审计
-   （`cursor_before → cursor_after`）；人工拒绝则游标不动。任务持久化于
-   `failover_rebuild_tasks`，可对照账本、Sink、游标页核验。
+3. **确认才切换**：确认前重新扫库复核（证据指纹 `evidence_fingerprint` 必须与提案时一致），
+   通过后在同一事务写新位点并留审计（`cursor_before → cursor_after`）；人工拒绝则游标不动。
+   任务持久化于 `failover_rebuild_tasks`，可对照账本、Sink、游标页核验。
+
+**游标不变量（回归红线）**：未确认前禁止改写流游标；证据不足或矛盾必须拒绝切换，
+且游标保持任务前值。`pending` 任务在页面上明示「游标锁定 = 未切换」（服务端字段
+`cursor_locked`），拒绝任务 `cursor_after == cursor_before`。
+
+**双相审计**：创建任务写 `proposal`（`cursor_before` / `candidate` /
+`evidence_fingerprint` / `gate`），confirm/reject 追加 `decision`（`action` /
+`cursor_after` / `untouched`）。审计存于任务 `audit_json`，页面以时间线展示。
+
+**证据对照（只读）**：`GET /api/failover-rebuild/tasks/{task_id}/comparison` 返回
+ledger 侧与 sink 侧候选分、冲突判定与 `evidence_changed`（当前证据 vs 任务快照）。
+任务详情内嵌的 `comparison` 字段、该接口与页面三处同源于 `side_scores()`。
 
 边界：不是回拨重放（不重放事件、不改 Sink/账本），也不是行级校验/漂移门禁
-（不逐行比对 payload）。页面内置演练工具：改坏游标、注入 Sink/账本矛盾、清理注入数据。
+（不逐行比对 payload）。页面内置演练工具：改坏游标、注入 Sink/账本矛盾、清理注入数据；
+「验收走查」面板按序勾选三步：pending 锁定 → 拒绝不动 → 确认切换。

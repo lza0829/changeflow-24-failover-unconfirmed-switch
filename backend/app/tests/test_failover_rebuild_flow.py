@@ -162,3 +162,203 @@ def test_task_persistence_and_listing(db_env):
     assert stored["status"] == "confirmed"
     assert stored["evidence"]["applied_seqs"] == [1, 2, 3, 4, 5]
     assert svc.get_task(created["id"])["candidate_cursor"] == 5
+
+
+# ---- 回归：未确认/已拒绝不得改写游标；双相审计与证据对照同源 ----
+
+
+def test_start_rebuild_never_switches_cursor_and_writes_proposal_audit(db_env):
+    svc = db_env["svc"]
+    apply_service = db_env["apply_service"]
+
+    apply_service.run_apply(1)
+    svc.demo_tamper_cursor(1, 0)
+
+    task = svc.start_rebuild(1)
+    assert task["status"] == "awaiting_confirmation"
+    assert _stream_cursor(1) == 0  # 未确认前游标保持任务前值
+    assert task["cursor_locked"] is True
+    assert task["cursor_switched"] is False
+    assert task["cursor_after"] == 0
+
+    proposal = task["audit"]["proposal"]
+    assert proposal["event"] == "scan_completed"
+    assert proposal["phase"] == "proposal"
+    assert proposal["cursor_before"] == 0
+    assert proposal["candidate"] == 5
+    assert proposal["gate"] == "ok"
+    assert proposal["evidence_fingerprint"] == task["evidence_fingerprint"]
+    assert task["audit"]["decision"] is None
+
+
+def test_reject_never_moves_cursor_and_appends_decision_audit(db_env):
+    svc = db_env["svc"]
+    apply_service = db_env["apply_service"]
+
+    apply_service.run_apply(2)
+    svc.demo_tamper_cursor(2, 7)  # 坏游标，非 0，确认拒绝后不被改成候选
+
+    task = svc.start_rebuild(2)
+    assert task["candidate_cursor"] == 3
+    assert _stream_cursor(2) == 7
+
+    rejected = svc.reject_rebuild(task["id"], reason="人工暂不切换")
+    assert rejected["status"] == "rejected_manual"
+    assert _stream_cursor(2) == 7  # 关键：拒绝绝不把游标改成候选
+    assert rejected["cursor_after"] == 7
+    assert rejected["cursor_switched"] is False
+
+    decision = rejected["audit"]["decision"]
+    assert decision["action"] == "reject"
+    assert decision["untouched"] is True
+    assert decision["cursor_after"] == 7
+    assert [e["event"] for e in rejected["audit"]["events"]] == [
+        "scan_completed",
+        "manual_rejected",
+    ]
+
+
+def test_confirm_appends_decision_audit(db_env):
+    svc = db_env["svc"]
+    apply_service = db_env["apply_service"]
+
+    apply_service.run_apply(1)
+    svc.demo_tamper_cursor(1, 0)
+    task = svc.start_rebuild(1)
+    assert _stream_cursor(1) == 0
+
+    decided = svc.confirm_rebuild(task["id"])
+    decision = decided["audit"]["decision"]
+    assert decision["action"] == "confirm"
+    assert decision["untouched"] is False
+    assert decision["cursor_after"] == 5
+    assert decided["cursor_after"] == 5
+    assert _stream_cursor(1) == 5
+    events = [e["event"] for e in decided["audit"]["events"]]
+    assert events == ["scan_completed", "cursor_switched"]
+
+
+def test_rejected_task_never_switches_cursor(db_env):
+    svc = db_env["svc"]
+    apply_service = db_env["apply_service"]
+
+    apply_service.run_apply(1)
+    svc.demo_tamper_cursor(1, 99)
+    svc.demo_inject_sink_contradiction(1, 99)
+
+    task = svc.start_rebuild(1)
+    assert task["status"] == "rejected"
+    assert task["candidate_cursor"] == 5
+    assert _stream_cursor(1) == 99  # 游标保持任务前值，不切到任一侧
+    assert task["cursor_locked"] is False  # 终态，锁定态不再适用
+    assert task["cursor_switched"] is False
+
+
+def test_comparison_endpoint_reports_side_scores_and_conflict(db_env):
+    svc = db_env["svc"]
+    apply_service = db_env["apply_service"]
+
+    apply_service.run_apply(1)
+    svc.demo_tamper_cursor(1, 0)
+    task = svc.start_rebuild(1)
+
+    ok = svc.get_comparison(task["id"])
+    assert ok["task_id"] == task["id"]
+    assert ok["ledger_side"]["candidate_score"] == 5
+    assert ok["sink_side"]["candidate_score"] == 5
+    assert ok["conflict"] is False
+    assert ok["agree"] is True
+    assert ok["evidence_changed"] is False
+    assert ok["scope"] == "live"
+    # 与任务视图同源
+    assert ok["evidence_fingerprint"] == task["evidence"]["evidence_fingerprint"]
+    assert task["comparison"]["ledger_side"]["candidate_score"] == ok["ledger_side"]["candidate_score"]
+
+    # 任务挂起期间注入矛盾，对照必须报冲突且标记证据已变化
+    svc.demo_inject_sink_contradiction(1, 99)
+    conflict = svc.get_comparison(task["id"])
+    assert conflict["conflict"] is True
+    assert conflict["agree"] is False
+    assert conflict["sink_side"]["candidate_score"] == 99
+    assert 99 in conflict["sink_side"]["unexplained_seqs"]
+    assert conflict["evidence_changed"] is True
+    # 任务创建时快照仍可追溯（候选为干净的 5）
+    assert conflict["snapshot"]["sink_side"]["candidate_score"] == 5
+    assert conflict["snapshot"]["conflict"] is False
+
+
+def test_stale_task_blocked_by_fingerprint_even_if_candidate_same(db_env):
+    """证据变化但候选位点数值不变时，也必须拒绝确认。"""
+    svc = db_env["svc"]
+    apply_service = db_env["apply_service"]
+
+    apply_service.run_apply(1)
+    svc.demo_tamper_cursor(1, 0)
+    task = svc.start_rebuild(1)
+    assert task["candidate_cursor"] == 5
+
+    # 新增 seq 7（6 缺口，故候选仍为 5），但证据指纹必然变化
+    from app.db import connect
+
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO applied_seqs(stream_id, seq, run_id, applied_at) VALUES (?,?,?,?)",
+            (1, 7, 999, "2026-11-01T00:00:00Z"),
+        )
+        conn.execute(
+            """
+            INSERT INTO change_ledger(stream_id, run_id, seq, op, entity_key, event_ts,
+                                      payload_json, disposition)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (1, 999, 7, "upsert", "ORD-9999", "2026-11-01T00:00:00Z", "{}", "applied"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(ValueError):
+        svc.confirm_rebuild(task["id"])
+    assert _stream_cursor(1) == 0
+
+    # 对照接口也应报告证据已变化
+    assert svc.get_comparison(task["id"])["evidence_changed"] is True
+
+
+def test_gate_rejected_task_records_decision_audit_untouched(db_env):
+    """门禁拒绝也写 decision 审计；游标保持任务前值。"""
+    svc = db_env["svc"]
+    apply_service = db_env["apply_service"]
+
+    apply_service.run_apply(1)
+    svc.demo_tamper_cursor(1, 99)
+    svc.demo_inject_sink_contradiction(1, 99)
+
+    task = svc.start_rebuild(1)
+    assert task["status"] == "rejected"
+    decision = task["audit"]["decision"]
+    assert decision["action"] == "reject"
+    assert decision["action_by"] == "gate"
+    assert decision["untouched"] is True
+    assert decision["cursor_after"] == 99
+    assert task["cursor_after"] == 99
+    assert _stream_cursor(1) == 99
+    assert task["audit"]["proposal"]["phase"] == "proposal"
+    assert [e["event"] for e in task["audit"]["events"]] == [
+        "scan_completed",
+        "gate_rejected",
+    ]
+
+
+def test_comparison_reports_insufficient_evidence(db_env):
+    svc = db_env["svc"]
+
+    task = svc.start_rebuild(2)  # 无任何应用/ Sink 证据
+    assert task["status"] == "rejected"
+    assert task["gate"] == "G1"
+    cmp = svc.get_comparison(task["id"])
+    assert cmp["sufficient"] is False
+    assert cmp["ledger_side"]["candidate_score"] == 0
+    assert cmp["sink_side"]["candidate_score"] == 0
+    assert _stream_cursor(2) == 0
